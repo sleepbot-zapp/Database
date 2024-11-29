@@ -30,7 +30,7 @@ class Database:
         if not os.path.exists(self.db_path):
             raise FileNotFoundError(f"Database '{db_name}' does not exist.")
         self.tables = {}  
-        self.is_active = True  # Flag to track if the database is still active
+        self.is_active = True
 
     def create_table(self, table_class: type):
         if not self.is_active:
@@ -154,7 +154,7 @@ class DBEngine:
 def database(db: Database):
     def decorator(cls):
         logging.info(f"Database '{db.db_name}' connection generated.")
-        cls._db = db  
+        cls._db = db
         return cls
     return decorator
 
@@ -183,12 +183,4 @@ if __name__ == "__main__":
     
     print(Person.search(name="Hello"))
 
-    # Terminate the database connection, preventing further changes
     test_db.terminate()
-
-    # This will raise an error since the connection is terminated
-    try:
-        p2 = Person(name="World", age=20)
-        p2.insert()
-    except RuntimeError as e:
-        print(e)
