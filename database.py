@@ -258,11 +258,7 @@ class Table:
         table_file_path = os.path.join(db_path, f"{cls.__name__}.table")
         if not os.path.exists(table_file_path):
             with open(table_file_path, "w") as table_file:
-                table_file.write(f"Table: {cls.__name__}\n")
-                table_file.write(
-                    f"Created on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                )
-            print(f"Created new table file: {table_file_path}")
+                print(f"Created new table file: {table_file_path}")
 
     @classmethod
     def insert(cls, row, database=None):
@@ -464,36 +460,3 @@ class Table:
             + " ".join(f"{k}={v}" for k, v in self.__dict__.items())
             + ">"
         )
-
-
-engine = DatabaseEngine()
-
-db = DB(engine, "test_db")
-db.connect()
-
-
-@database(db)
-class Member(Table):
-    _id: int
-    name: str
-    tag: int
-    role: str
-
-
-m1 = Member(_id=1, name="Aarthex", tag=56, role="sus")
-
-Member.insert(m1)
-Member.update({"_id": 1}, {"name": "hello"})
-Member.search(_id=1)
-Member.delete(_id=1)
-
-
-@database(db)
-class Foot(Table):
-    _id: int
-    name: str
-
-
-Foot.insert(Foot(_id=1, name="no"))
-
-db.disconnect()
