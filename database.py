@@ -383,7 +383,7 @@ class Table:
                     encrypted_row = cls._encrypt_data(row_data, db.database_name)
                     table_file.write(encrypted_row + "\n")
         print(
-            f"Updated {len(rows_to_delete)} {'row'if len(rows_to_delete)==1 else 'rows'} from {cls.__name__}"
+            f"Deleted {len(rows_to_delete)} {'row'if len(rows_to_delete)==1 else 'rows'} from {cls.__name__}"
         )
         return deleted_rows
 
