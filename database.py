@@ -1,186 +1,499 @@
-import os
-import pickle
-import logging
 from typing import List, Dict, Any
-from table import Table
+import os
+import time
+from collections import deque
+from datetime import datetime
+import uuid
+import stat
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import padding
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+import json
 
-log_dir = 'db_engine/global'
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir)
-logging.basicConfig(
-    filename=os.path.join(log_dir, 'database.log'),
-    level=logging.INFO,
-    format='%(asctime)s - %(message)s'
-)
 
+class DatabaseEngine:
+    def __init__(self, base_dir="db_engine", passphrase="supersecret"):
+        self.base_dir = base_dir
+        self.databases_dir = os.path.join(base_dir, "databases")
+        self.global_log_path = os.path.join(base_dir, "global", "global.log")
+        self.active_connections = {}
+        self.connection_queues = {}
 
-class Database:
-    """
-    A class representing a database and providing methods for creating tables,
-    and performing operations (insert, search, update, delete) on them.
-    """
-    DB_ROOT = "db_engine/databases"
+        os.makedirs(self.databases_dir, exist_ok=True)
+        os.makedirs(os.path.join(base_dir, "global"), exist_ok=True)
 
-    def __init__(self, db_name: str):
-        """
-        Initialize the database, either creating it or loading an existing one.
-        """
-        self.db_name = db_name
-        self.db_path = os.path.join(self.DB_ROOT, db_name)
-        if not os.path.exists(self.db_path):
-            raise FileNotFoundError(f"Database '{db_name}' does not exist.")
-        self.tables = {}  
-        self.is_active = True
+        self.passphrase = passphrase
+        self._log_global("Database engine initialized.")
 
-    def create_table(self, table_class: type):
-        if not self.is_active:
-            raise RuntimeError("Cannot create table. Database connection is terminated.")
-        
-        """
-        Register a table class in the database, dynamically associating the table
-        with the current database instance.
-        """
-        table_name = table_class.__name__.lower()
-        if table_name in self.tables:
-            raise RuntimeError(f"Table '{table_name}' already exists.")
-        
-        table_class._db = self
-        self.tables[table_name] = table_class
-        logging.info(f"Table '{table_name}' created in database '{self.db_name}'.")
+    def _log_global(self, message):
+        """Logs a message to the global log."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] {message}\n"
+        with open(self.global_log_path, "a") as log_file:
+            log_file.write(log_message)
 
-    def insert_row(self, row: Table):
-        if not self.is_active:
-            raise RuntimeError("Cannot insert row. Database connection is terminated.")
-        
-        """
-        Insert a row into the table's binary file.
-        """
-        table_name = row.__class__.__name__.lower()
-        table_file = os.path.join(self.db_path, f"{table_name}.bin")
+    def _log_database(self, database_name, message):
+        """Logs a message to a specific database's log."""
+        db_log_path = os.path.join(
+            self.databases_dir, database_name, f"{database_name}.log"
+        )
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_message = f"[{timestamp}] {message}\n"
+        with open(db_log_path, "a") as log_file:
+            log_file.write(log_message)
 
-        rows = self._load_table_data(table_name)
-        rows.append(row)
-        self._save_table_data(table_name, rows)
+    def _initialize_database_if_needed(self, database_name):
+        """Initialize the connection tracking for a database if not already set up."""
+        if database_name not in self.active_connections:
+            db_path = os.path.join(self.databases_dir, database_name)
+            if not os.path.exists(db_path):
+                self._log_global(
+                    f"Failed to access database '{database_name}': does not exist."
+                )
+                raise FileNotFoundError(f"Database '{database_name}' does not exist.")
 
-    def search_rows(self, table_class, **conditions) -> List[Table]:
-        if not self.is_active:
-            raise RuntimeError("Cannot search rows. Database connection is terminated.")
-        
-        """
-        Search for rows in a given table that match the conditions.
-        """
-        table_name = table_class.__name__.lower()
-        rows = self._load_table_data(table_name)
-        return [row for row in rows if all(getattr(row, k) == v for k, v in conditions.items())]
+            self.active_connections[database_name] = None
+            self.connection_queues[database_name] = deque()
+            self._log_global(f"Database '{database_name}' initialized.")
+            self._log_database(database_name, "Connection tracking initialized.")
 
-    def update_rows(self, table_class, conditions: Dict[str, Any], updates: Dict[str, Any]):
-        if not self.is_active:
-            raise RuntimeError("Cannot update rows. Database connection is terminated.")
-        
-        """
-        Update rows in a given table that match the conditions with the new values in updates.
-        """
-        table_name = table_class.__name__.lower()
-        rows = self._load_table_data(table_name)
+    def create_database(self, database_name):
+        """Creates a new database directory and log file, encrypting the database key."""
+        db_path = os.path.join(self.databases_dir, database_name)
+        if os.path.exists(db_path):
+            self._log_global(
+                f"Failed to create database '{database_name}': already exists."
+            )
+            raise FileExistsError(f"Database '{database_name}' already exists.")
 
-        for row in rows:
-            if all(getattr(row, k) == v for k, v in conditions.items()):
-                for key, value in updates.items():
-                    setattr(row, key, value)
+        os.makedirs(db_path)
 
-        self._save_table_data(table_name, rows)
+        db_key = str(uuid.uuid4())
 
-    def delete_rows(self, table_class, **conditions):
-        if not self.is_active:
-            raise RuntimeError("Cannot delete rows. Database connection is terminated.")
-        
-        """
-        Delete rows in a given table that match the conditions.
-        """
-        table_name = table_class.__name__.lower()
-        rows = self._load_table_data(table_name)
+        encrypted_key = self._encrypt_key(db_key)
 
-        filtered_rows = [row for row in rows if not all(getattr(row, k) == v for k, v in conditions.items())]
-        self._save_table_data(table_name, filtered_rows)
+        with open(os.path.join(db_path, "database.key"), "wb") as key_file:
+            key_file.write(encrypted_key)
 
-    def _save_table_data(self, table_name, rows):
-        """
-        Save table data to a binary file.
-        """
-        table_file = os.path.join(self.db_path, f"{table_name}.bin")
-        with open(table_file, "wb") as f:
-            pickle.dump(rows, f)
+        self._set_read_only(os.path.join(db_path, "database.key"))
 
-    def _load_table_data(self, table_name):
-        """
-        Load table data from a binary file.
-        """
-        table_file = os.path.join(self.db_path, f"{table_name}.bin")
-        if not os.path.exists(table_file):
-            return []
-        with open(table_file, "rb") as f:
-            return pickle.load(f)
+        db_log_path = os.path.join(db_path, f"{database_name}.log")
+        with open(db_log_path, "w") as log_file:
+            log_file.write("")
 
-    def terminate(self):
-        """
-        Close the database connection and save all changes to the disk.
-        """
-        if self.is_active:
-            logging.info(f"Database '{self.db_name}' connection terminated.")
-            self.is_active = False
-        else:
-            logging.warning(f"Database '{self.db_name}' is already terminated.")
+        self._log_global(f"Database '{database_name}' created.")
+        self._log_database(database_name, f"Database '{database_name}' created.")
 
-class DBEngine:
-    """
-    A class to manage the creation of databases and logging operations.
-    """
-    DB_ROOT = "db_engine/databases"
-    
-    @staticmethod
-    def create_database(db_name: str):
-        """
-        Create a new database directory if it doesn't already exist.
-        Logs the operation to 'database.log'.
-        """
-        db_path = os.path.join(DBEngine.DB_ROOT, db_name)
+    def delete_database(self, database_name):
+        """Deletes a database directory and its log file."""
+        db_path = os.path.join(self.databases_dir, database_name)
         if not os.path.exists(db_path):
-            os.makedirs(db_path)
-            logging.info(f"Database '{db_name}' created.")
-        else:
-            logging.info(f"Database '{db_name}' already exists.")
+            self._log_global(
+                f"Failed to delete database '{database_name}': does not exist."
+            )
+            raise FileNotFoundError(f"Database '{database_name}' does not exist.")
+
+        if self.active_connections.get(database_name):
+            raise RuntimeError(
+                f"Cannot delete database '{database_name}': Active connections exist."
+            )
+
+        for file in os.listdir(db_path):
+            os.remove(os.path.join(db_path, file))
+        os.rmdir(db_path)
+
+        self.active_connections.pop(database_name, None)
+        self.connection_queues.pop(database_name, None)
+
+        self._log_global(f"Database '{database_name}' deleted.")
+
+    def _set_read_only(self, file_path):
+        """Sets the file to read-only, so it cannot be modified or deleted."""
+
+        current_permissions = stat.S_IMODE(os.lstat(file_path).st_mode)
+
+        os.chmod(file_path, current_permissions & ~stat.S_IWRITE)
+
+    def _encrypt_key(self, db_key: str) -> bytes:
+        """Encrypt the database key using AES-256."""
+
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=os.urandom(16),
+            iterations=100000,
+            backend=default_backend(),
+        )
+        aes_key = kdf.derive(self.passphrase.encode())
+
+        iv = os.urandom(16)
+        cipher = Cipher(
+            algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend()
+        )
+        encryptor = cipher.encryptor()
+
+        padder = padding.PKCS7(128).padder()
+        padded_data = padder.update(db_key.encode()) + padder.finalize()
+
+        encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+
+        return iv + encrypted_data
+
+    def _decrypt_key(self, encrypted_key: bytes) -> str:
+        """Decrypt the database key using AES-256."""
+        iv = encrypted_key[:16]
+        encrypted_data = encrypted_key[16:]
+
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=os.urandom(16),
+            iterations=100000,
+            backend=default_backend(),
+        )
+        aes_key = kdf.derive(self.passphrase.encode())
+
+        cipher = Cipher(
+            algorithms.AES(aes_key), modes.CBC(iv), backend=default_backend()
+        )
+        decryptor = cipher.decryptor()
+
+        decrypted_data = decryptor.update(encrypted_data) + decryptor.finalize()
+
+        unpadder = padding.PKCS7(128).unpadder()
+        unpadded_data = unpadder.update(decrypted_data) + unpadder.finalize()
+
+        return unpadded_data.decode()
 
 
-def database(db: Database):
+class DB:
+    def __init__(self, engine: DatabaseEngine, database_name: str):
+        self.engine = engine
+        self.database_name = database_name
+        self._connected = False
+
+        self.engine._initialize_database_if_needed(database_name)
+
+    def connect(self):
+        """Connects to the database."""
+        if self._connected:
+            raise RuntimeError(f"Already connected to database '{self.database_name}'.")
+
+        self.engine._initialize_database_if_needed(self.database_name)
+        queue = self.engine.connection_queues[self.database_name]
+        queue.append(os.getpid())
+
+        while queue[0] != os.getpid():
+            time.sleep(0.1)
+
+        self.engine.active_connections[self.database_name] = os.getpid()
+        self._connected = True
+
+        self.engine._log_global(
+            f"Connected to database '{self.database_name}' (PID: {os.getpid()})."
+        )
+        self.engine._log_database(
+            self.database_name, f"Connection established (PID: {os.getpid()})."
+        )
+        return self
+
+    def disconnect(self):
+        """Disconnects from the database."""
+        if not self._connected:
+            raise RuntimeError(f"Not connected to database '{self.database_name}'.")
+
+        self.engine.active_connections[self.database_name] = None
+        self.engine.connection_queues[self.database_name].popleft()
+        self._connected = False
+
+        self.engine._log_global(
+            f"Disconnected from database '{self.database_name}' (PID: {os.getpid()})."
+        )
+        self.engine._log_database(
+            self.database_name, f"Connection closed (PID: {os.getpid()})."
+        )
+
+    def is_connected(self):
+        """Check if connected to the database."""
+        return self._connected
+
+
+def database(db_instance):
+    """Decorator to automatically associate a table with a database instance."""
+
     def decorator(cls):
-        logging.info(f"Database '{db.db_name}' connection generated.")
-        cls._db = db
+        cls._db = db_instance
         return cls
+
     return decorator
 
 
-if __name__ == "__main__":
-    
-    DBEngine.create_database('test_db')
-    
-    test_db = Database('test_db')
-    
-    @database(test_db)
-    class Person(Table):
-        name: str
-        age: int
-    
-    p1 = Person(name="Hello", age=12)
-    p1.insert()
-    
-    print(Person.search(name="Hello"))
-    
-    Person.update(conditions={"name": "Hello"}, updates={"age": 17})
-    
-    print(Person.search(name="Hello"))
+class Table:
+    """A base class for table operations."""
 
-    Person.delete(name="Hello")
-    
-    print(Person.search(name="Hello"))
+    _db = None
 
-    test_db.terminate()
+    def __init__(self, **kwargs):
+        """Initialize a row in the table with the provided column values."""
+        for col, value in kwargs.items():
+            setattr(self, col, value)
+
+        if self._db is not None:
+            self._create_table_file()
+
+    @classmethod
+    def _create_table_file(cls):
+        """Create a file with the class name in the respective database's directory."""
+        if cls._db is None:
+            raise RuntimeError(f"No database provided for {cls.__name__}.")
+
+        db_path = os.path.join(cls._db.engine.databases_dir, cls._db.database_name)
+        if not os.path.exists(db_path):
+            raise FileNotFoundError(
+                f"Database '{cls._db.database_name}' does not exist."
+            )
+
+        table_file_path = os.path.join(db_path, f"{cls.__name__}.table")
+        if not os.path.exists(table_file_path):
+            with open(table_file_path, "w") as table_file:
+                table_file.write(f"Table: {cls.__name__}\n")
+                table_file.write(
+                    f"Created on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+            print(f"Created new table file: {table_file_path}")
+
+    @classmethod
+    def insert(cls, row, database=None):
+        """Insert the current row into the table in the associated database."""
+        if not cls._is_connected():
+            raise RuntimeError("Cannot perform operations: Database is disconnected.")
+
+        db = database if database else cls._db
+        if db is None:
+            raise RuntimeError(f"No database provided for {cls.__name__}.")
+
+        row_dict = {col: getattr(row, col) for col in row.__dict__}
+
+        encrypted_row = cls._encrypt_data(row_dict, db.database_name)
+
+        table_file_path = os.path.join(
+            db.engine.databases_dir, db.database_name, f"{cls.__name__}.table"
+        )
+
+        with open(table_file_path, "a") as table_file:
+            table_file.write(encrypted_row + "\n")
+
+        print(f"Inserted row into {cls.__name__}")
+
+    @classmethod
+    def search(cls, surpress_print=False, database=None, **conditions) -> List["Table"]:
+        """Search for rows that match the given conditions in the associated database."""
+        if not cls._is_connected():
+            raise RuntimeError("Cannot perform operations: Database is disconnected.")
+
+        db = database if database else cls._db
+        if db is None:
+            raise RuntimeError(f"No database provided for {cls.__name__}.")
+
+        table_file_path = os.path.join(
+            db.engine.databases_dir, db.database_name, f"{cls.__name__}.table"
+        )
+
+        rows = []
+        with open(table_file_path, "r") as table_file:
+            for line in table_file:
+
+                decrypted_row = cls._decrypt_data(line.strip(), db.database_name)
+
+                if all(decrypted_row.get(k) == v for k, v in conditions.items()):
+                    rows.append(decrypted_row)
+
+        if not surpress_print:
+            print(f"Found rows matching conditions {conditions}: {rows}")
+        return rows
+
+    @classmethod
+    def update(cls, conditions: Dict[str, Any], updates: Dict[str, Any], database=None):
+        """Update rows in the table matching conditions with the provided updates."""
+        if not cls._is_connected():
+            raise RuntimeError("Cannot perform operations: Database is disconnected.")
+
+        db = database if database else cls._db
+        if db is None:
+            raise RuntimeError(f"No database provided for {cls.__name__}.")
+
+        rows_to_update = cls.search(database=db, surpress_print=True, **conditions)
+
+        if not rows_to_update:
+            return []
+
+        updated_rows = []
+        table_file_path = os.path.join(
+            db.engine.databases_dir, db.database_name, f"{cls.__name__}.table"
+        )
+
+        with open(table_file_path, "r") as table_file:
+            lines = table_file.readlines()
+
+        with open(table_file_path, "w") as table_file:
+            for line in lines:
+                row_data = cls._decrypt_data(line.strip(), db.database_name)
+
+                if all(row_data.get(k) == v for k, v in conditions.items()):
+                    row_data.update(updates)
+                    updated_rows.append(row_data)
+
+                encrypted_row = cls._encrypt_data(row_data, db.database_name)
+                table_file.write(encrypted_row + "\n")
+        print(
+            f"Updated {len(rows_to_update)} {'row'if len(rows_to_update)==1 else 'rows'} from {cls.__name__}"
+        )
+        return updated_rows
+
+    @classmethod
+    def delete(cls, database=None, **conditions):
+        """Delete rows matching the given conditions."""
+        if not cls._is_connected():
+            raise RuntimeError("Cannot perform operations: Database is disconnected.")
+
+        db = database if database else cls._db
+        if db is None:
+            raise RuntimeError(f"No database provided for {cls.__name__}.")
+
+        #
+        rows_to_delete = cls.search(database=db, surpress_print=True, **conditions)
+
+        if not rows_to_delete:
+            return []
+
+        deleted_rows = []
+        table_file_path = os.path.join(
+            db.engine.databases_dir, db.database_name, f"{cls.__name__}.table"
+        )
+
+        with open(table_file_path, "r") as table_file:
+            lines = table_file.readlines()
+
+        with open(table_file_path, "w") as table_file:
+            for line in lines:
+                row_data = cls._decrypt_data(line.strip(), db.database_name)
+
+                if all(row_data.get(k) == v for k, v in conditions.items()):
+                    deleted_rows.append(row_data)
+                else:
+
+                    encrypted_row = cls._encrypt_data(row_data, db.database_name)
+                    table_file.write(encrypted_row + "\n")
+        print(
+            f"Updated {len(rows_to_delete)} {'row'if len(rows_to_delete)==1 else 'rows'} from {cls.__name__}"
+        )
+        return deleted_rows
+
+    @classmethod
+    def _is_connected(cls):
+        """Check if the current database connection is active."""
+        return cls._db is not None and cls._db.is_connected()
+
+    @classmethod
+    def _get_decryption_key(cls, database_name: str) -> bytes:
+        """Retrieve and decrypt the database's encryption key."""
+        db_path = os.path.join(cls._db.engine.databases_dir, database_name)
+        with open(os.path.join(db_path, "database.key"), "rb") as key_file:
+            encrypted_key = key_file.read()
+
+        decrypted_key = cls._decrypt_key(encrypted_key)
+        return decrypted_key
+
+    @classmethod
+    def _decrypt_key(cls, encrypted_key: bytes) -> bytes:
+        """Decrypt the encrypted database key and ensure it's of valid length."""
+
+        digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+        digest.update(encrypted_key)
+        decrypted_key = digest.finalize()
+
+        return decrypted_key
+
+    @classmethod
+    def _encrypt_data(cls, data: dict, database_name: str) -> str:
+        """Encrypt the row data using the database's key."""
+        decryption_key = cls._get_decryption_key(database_name)
+
+        cipher = Cipher(
+            algorithms.AES(decryption_key),
+            modes.CBC(decryption_key[:16]),
+            backend=default_backend(),
+        )
+        encryptor = cipher.encryptor()
+
+        json_data = json.dumps(data).encode()
+        padder = padding.PKCS7(128).padder()
+        padded_data = padder.update(json_data) + padder.finalize()
+
+        encrypted_data = encryptor.update(padded_data) + encryptor.finalize()
+
+        return encrypted_data.hex()
+
+    @classmethod
+    def _decrypt_data(cls, encrypted_data: str, database_name: str) -> dict:
+        """Decrypt the encrypted row data."""
+        decryption_key = cls._get_decryption_key(database_name)
+
+        cipher = Cipher(
+            algorithms.AES(decryption_key),
+            modes.CBC(decryption_key[:16]),
+            backend=default_backend(),
+        )
+        decryptor = cipher.decryptor()
+
+        encrypted_data = bytes.fromhex(encrypted_data)
+
+        decrypted_data = decryptor.update(encrypted_data) + decryptor.finalize()
+
+        unpadder = padding.PKCS7(128).unpadder()
+        unpadded_data = unpadder.update(decrypted_data) + unpadder.finalize()
+
+        return json.loads(unpadded_data.decode())
+
+    def __repr__(self):
+        """String representation of a row."""
+        return (
+            f"<{self.__class__.__name__} "
+            + " ".join(f"{k}={v}" for k, v in self.__dict__.items())
+            + ">"
+        )
+
+
+engine = DatabaseEngine()
+
+db = DB(engine, "test_db")
+db.connect()
+
+
+@database(db)
+class Member(Table):
+    _id: int
+    name: str
+    tag: int
+    role: str
+
+
+m1 = Member(_id=1, name="Aarthex", tag=56, role="sus")
+
+Member.insert(m1)
+Member.update({"_id": 1}, {"name": "hello"})
+Member.search(_id=1)
+Member.delete(_id=1)
+
+
+@database(db)
+class Foot(Table):
+    _id: int
+    name: str
+
+
+Foot.insert(Foot(_id=1, name="no"))
+
+db.disconnect()
